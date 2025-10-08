@@ -3,8 +3,8 @@
 OS 363 Project: Device-Mapper COW Snapshot Simulator
 Team: Gungun Agarwal, Sakshi, Anika Garg
 Description: A simulator that implements the core concepts of a Linux device-mapper
-             snapshot target using Copy-on-Write (COW).
-Version: 3.0 (Final)
+             snapshot target using Copy-on-Write (COW), including a revert feature.
+Version: 4.0 (Final)
 """
 
 import os
@@ -63,29 +63,23 @@ class CowSnapshotSystem:
         block_id = block_index
         block_start = block_id * self.block_size
         
-        # 1. Read the existing block to find the end of the data.
         with open(self.base_device_file, 'rb') as f:
             f.seek(block_start)
             block_content = f.read(self.block_size)
         
         existing_data = block_content.rstrip(b'\x00')
         
-        # 2. Prepare the new data and calculate the append position.
         if existing_data:
-            # If there's data, add a space before appending the new data.
             data_to_write = b" " + data.encode()
             append_position = block_start + len(existing_data)
         else:
-            # If the block is empty, just write the new data from the start.
             data_to_write = data.encode()
             append_position = block_start
 
-        # 3. Check if the new data will fit in the block.
         if len(existing_data) + len(data_to_write) > self.block_size:
             messagebox.showerror("Error", f"Not enough space in block {block_id} to append data.")
             return
 
-        # Perform COW check before modifying the block
         if (self.snapshot_protected_blocks is not None and
                 block_id in self.snapshot_protected_blocks and
                 block_id not in self.cow_bitmap):
@@ -97,7 +91,6 @@ class CowSnapshotSystem:
                 f.write(original_data)
             self.cow_bitmap[block_id] = fname
 
-        # 4. Write the new data at the calculated append position.
         with open(self.base_device_file, 'r+b') as f:
             f.seek(append_position)
             f.write(data_to_write)
@@ -151,13 +144,42 @@ class CowSnapshotSystem:
 
         return result[:bytes_actually_read].decode(errors='ignore').rstrip('\x00')
 
+    def revert_to_snapshot(self):
+        """Reverts the base device to the state of the last snapshot."""
+        if self.snapshot_protected_blocks is None:
+            return False
+
+        # Clear the live disk
+        with open(self.base_device_file, 'wb') as f:
+            f.write(b'\x00' * self.disk_size)
+        
+        # Write data from the snapshot's point-of-view back to the live disk
+        with open(self.base_device_file, 'r+b') as live_f:
+            for block_id in self.snapshot_protected_blocks:
+                block_start = block_id * self.block_size
+                snapshot_block_data = self.read_data(block_start, self.block_size, from_snapshot=True)
+                
+                if snapshot_block_data:
+                    live_f.seek(block_start)
+                    live_f.write(snapshot_block_data.encode())
+        
+        self.live_blocks = self.snapshot_protected_blocks.copy()
+        
+        # Deactivate the snapshot
+        self.snapshot_protected_blocks = None
+        self.snapshot_time = None
+        self.cow_bitmap.clear()
+        
+        return True
+
+
 # ==============================================================================
 # ## Frontend: The Tkinter GUI Application
 # ==============================================================================
 
 class CowGuiApp:
     def __init__(self, root):
-        self.version = "3.0 (Final)" # Version number for verification
+        self.version = "4.0 (Final)" # Version number for verification
         self.root = root
         self.root.title(f"Device-Mapper COW Simulator - v{self.version}")
         self.system = None
@@ -197,6 +219,10 @@ class CowGuiApp:
         snapshot_frame = ttk.LabelFrame(main_frame, text="📸 Snapshot Control")
         snapshot_frame.pack(fill="x", pady=5)
         ttk.Button(snapshot_frame, text="Create Instant Snapshot", command=self.take_snapshot).pack(side="left", padx=5, pady=5)
+        
+        self.revert_button = ttk.Button(snapshot_frame, text="Revert to Snapshot", command=self.revert_snapshot, state="disabled")
+        self.revert_button.pack(side="left", padx=5, pady=5)
+        
         self.snapshot_label = ttk.Label(snapshot_frame, text="No snapshot active", font=('Segoe UI', 9, 'italic'))
         self.snapshot_label.pack(side="left", padx=10)
 
@@ -232,8 +258,7 @@ class CowGuiApp:
             block_size = int(self.block_entry.get())
             self.system = CowSnapshotSystem(disk_size, block_size)
             messagebox.showinfo("Success", "Base device and COW storage have been initialized.")
-            self.snapshot_label.config(text="No snapshot active")
-            self.update_status()
+            self.update_ui_state()
         except ValueError:
             messagebox.showerror("Error", "Device and block sizes must be integers.")
         except Exception as e:
@@ -245,7 +270,7 @@ class CowGuiApp:
             block_index = int(self.write_block_entry.get())
             data = self.write_data_entry.get()
             self.system.write_data(block_index, data)
-            self.update_status()
+            self.update_ui_state()
             self.write_data_entry.delete(0, tk.END)
         except ValueError:
             messagebox.showerror("Error", "Block index must be an integer.")
@@ -255,9 +280,8 @@ class CowGuiApp:
     def take_snapshot(self):
         if not self.system: return
         latency = self.system.take_snapshot()
-        self.snapshot_label.config(text=f"Snapshot Active (Creation Latency: {latency:.4f} ms)")
         messagebox.showinfo("Snapshot Created", f"Virtual snapshot device is now active.\nCreation latency: {latency:.4f} ms")
-        self.update_status()
+        self.update_ui_state()
 
     def read_data(self):
         if not self.system: return
@@ -278,14 +302,33 @@ class CowGuiApp:
         except Exception as e:
             messagebox.showerror("Error", f"A read error occurred: {e}")
 
-    def update_status(self):
-        """Updates the status panel with device-mapper terminology."""
+    def revert_snapshot(self):
+        """GUI function to handle reverting to a snapshot."""
         if not self.system: return
-        self.status_text.delete("1.0", tk.END)
+        
+        if messagebox.askyesno("Confirm Revert", "Are you sure you want to revert the base device to the last snapshot? This will erase all changes made since the snapshot was taken."):
+            success = self.system.revert_to_snapshot()
+            if success:
+                messagebox.showinfo("Success", "Base device has been reverted to the snapshot state. The snapshot is no longer active.")
+            else:
+                messagebox.showerror("Error", "No active snapshot to revert to.")
+            self.update_ui_state()
+
+    def update_ui_state(self):
+        """Central function to update the entire UI based on the system's state."""
+        if not self.system: return
         
         is_snap_active = self.system.snapshot_protected_blocks is not None
-        snap_status = "Active" if is_snap_active else "Inactive"
         
+        if is_snap_active:
+            self.snapshot_label.config(text="Snapshot Active")
+            self.revert_button.config(state="normal")
+        else:
+            self.snapshot_label.config(text="No snapshot active")
+            self.revert_button.config(state="disabled")
+
+        self.status_text.delete("1.0", tk.END)
+        snap_status = "Active" if is_snap_active else "Inactive"
         lines = [
             f"Base Device: '{self.system.base_device_file}' ({self.system.disk_size // 1024} KB)",
             f"COW Storage: {len(self.system.cow_bitmap)} modified block(s) stored.",
@@ -293,7 +336,9 @@ class CowGuiApp:
         ]
         self.status_text.insert(tk.END, "\n".join(lines))
 
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = CowGuiApp(root)
     root.mainloop()
+
