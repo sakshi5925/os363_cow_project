@@ -14,9 +14,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
 
-# ==============================================================================
-# ## Backend: The Copy-on-Write System Logic
-# ==============================================================================
+
 
 class CowSnapshotSystem:
     def __init__(self, disk_size_kb=1024, block_size_kb=64):
